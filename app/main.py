@@ -393,7 +393,7 @@ async def repair_from_schema_mismatch(question: str, sql: str, mismatch_detail: 
 
 @app.on_event("startup")
 async def startup():
-    app.state.pool = await asyncpg.create_pool(dsn=DB_URL, min_size=1, max_size=8)
+    app.state.pool = await asyncpg.create_pool(dsn=DB_URL, min_size=1, max_size=8, ssl='require')
     await load_schema_cache(app.state.pool)
 
 @app.on_event("shutdown")
