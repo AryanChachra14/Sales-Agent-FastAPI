@@ -464,7 +464,7 @@ async def generate_report(data: ReportRequest):
 async def answer_report(answer_req: AnswerReq):
     timeout = httpx.Timeout(60.0, read=60.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        answer_resp = await client.post("http://127.0.0.1:8000/answer", json=answer_req.dict())
+        answer_resp = await client.post("https://sales-agent-fastapi.onrender.com/answer", json=answer_req.dict())
         answer_response = answer_resp.json()
         print("Answer Response:", answer_response)
         if "error" in answer_response:
@@ -473,7 +473,7 @@ async def answer_report(answer_req: AnswerReq):
             "question":answer_req.chatInput,
             "sqlData":answer_response.get("data", [])
         }
-        report_resp = await client.post("http://127.0.0.1:8000/report", json=report_req)
+        report_resp = await client.post("https://sales-agent-fastapi.onrender.com/report", json=report_req)
         report_response = report_resp.json()
     return {
         "answer": answer_response,
