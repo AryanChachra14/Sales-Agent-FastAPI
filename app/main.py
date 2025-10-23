@@ -6,9 +6,10 @@ from typing import Optional, List, Dict, Any
 import os, json, re, asyncpg, httpx
 from dotenv import load_dotenv
 import httpx
+import difflib
 
 load_dotenv()
-DB_URL = os.getenv("DATABASE_URL", "").replace("postgresql+psycopg2", "postgresql")
+DB_URL = os.getenv("DATABASE_URL", "")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "60"))
