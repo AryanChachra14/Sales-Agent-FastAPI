@@ -7,6 +7,7 @@ import os, json, re, asyncpg, httpx
 from dotenv import load_dotenv
 import httpx
 import difflib
+import uvicorn
 
 load_dotenv()
 DB_URL = os.getenv("DATABASE_URL", "")
@@ -481,3 +482,6 @@ async def answer_report(answer_req: AnswerReq):
         "report": report_response.get("report")
     }
 
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info", reload=True)
