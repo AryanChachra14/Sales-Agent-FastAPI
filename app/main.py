@@ -16,66 +16,6 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "60"))
 STATEMENT_TIMEOUT_MS = int(os.getenv("STATEMENT_TIMEOUT_MS", "2000"))
 
-SYSTEM_PROMPT_SQL_AGENT = """
-You convert one sales-analytics question into a single, precise PostgreSQL SELECT/CTE query for this physical schema:
-
-document_metadata(id TEXT PRIMARY KEY, title TEXT, url TEXT, created_at TIMESTAMP, schema TEXT)
-document_rows(id INT PRIMARY KEY, dataset_id TEXT REFERENCES document_metadata(id), row_data JSONB)
-documents(id BIGINT PRIMARY KEY, content TEXT, metadata JSONB, embedding USER-DEFINED)
-memories(id BIGINT PRIMARY KEY, content TEXT, metadata JSONB, embedding USER-DEFINED)
-
-Hard rules:
-- Output a single executable query only. Start with SELECT or WITH. No prose, no code fences.
-- Use only these physical tables: document_rows, document_metadata, documents, memories. CTE names are allowed.
-- Datasets (leads, contacts, activities, stages, users) are never table names. They are values of document_metadata.title.
-- For EVERY alias that references row_data->>'...': you MUST scope that alias to exactly one dataset using either:
-    JOIN document_metadata AS <alias>_meta
-      ON <alias>.dataset_id = <alias>_meta.id AND <alias>_meta.title = '<dataset>'
-  OR:
-    <alias>.dataset_id = (SELECT id FROM document_metadata WHERE title = '<dataset>')
-- Access JSON with exact-case keys: <alias>.row_data->>'Exact Field'. Keys are case-sensitive.
-- Do not invent fields. Use only fields that exist in document_metadata.schema for that dataset.
-- Dates are text; on ANY date comparison/filter/order, wrap the expression in:
-  COALESCE(
-    to_date(trim(x),'FMMM-FMDD-YYYY'),
-    to_date(trim(x),'FMMM/FMDD/YYYY'),
-    to_date(trim(x),'FMMM-FMDD-YY'),
-    to_date(trim(x),'FMMM/FMDD/YY')
-  )
-- For numeric inequalities, cast text to numeric: (<alias>.row_data->>'Field')::numeric
-- Join keys (direction matters):
-  leads.row_data->>'stage_id'    = stages.row_data->>'id'
-  leads.row_data->>'partner_id'  = contacts.row_data->>'id'
-  leads.row_data->>'activity_id' = activities.row_data->>'id'
-- If the user writes a literal like 'stage_2A', compare directly: leads.row_data->>'stage_id' = 'stage_2A'
-  (DO NOT cast stage_id to numeric. DO NOT look this up by stages.name.)
-- Never cast 'stage_id' or 'id' to numeric. Do not use created_at/updated_at unless they exist in the dataset schema.
-- “not touched / inactive / missed follow-up”: prefer LEFT JOIN to activities; NULL last/next-contact qualifies.
-- “latest/most recent/last per entity”: use a correlated MAX(date) per entity, not ORDER BY alone.
-- Deterministic: same question → same SQL. Keep aliases stable and descriptive.
-Return ONLY the SQL.
-"""
-
-SYSTEM_PROMPT_REPORT_AGENT = """
-You are an assistant that produces a concise, structured inference (maximum 250 characters) along with a complete data table based on the corpus of documents and/or database query results provided.
-
-Key Instructions:
-- When database query results are given in JSON, treat them as the authoritative data source.
-- Present all data in a Markdown table before the inference.
-- Use these results to generate a brief, focused inference.
-- Do not create or execute SQL queries or fetch data yourself.
-- Avoid hallucinating or inferring facts not present in the data.
-- Highlight missing details or limitations only if relevant to the inference.
-- Format the inference in Markdown.
-- Use headers (###) only if needed for clarity.
-- Use inline formatting (italic or bold) sparingly for emphasis.
-- Use code blocks (```) only if a JSON snippet or formula is essential.
-- If no data is provided but the question can be answered from documents, generate a concise, well-reasoned inference without mentioning data absence.
-- Maintain a pragmatic, professional, and analytical tone.
-- Prioritize clarity and precision over length.
-"""
-
-
 app = FastAPI(title="Sales Analyst Orchestrator", version="2.4.0", default_response_class=JSONResponse)
 
 app.add_middleware(
@@ -143,6 +83,13 @@ def sanitize_llm_sql(text: str) -> str:
     if s and not s.endswith(';'):
         s += ';'
     return s
+
+async def get_prompt(pool, prompt_type: str) -> str:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT prompt FROM prompts WHERE title = $1", prompt_type)
+    if not row:
+        raise HTTPException(500, f"Prompt for type {prompt_type} not found in DB")
+    return row["prompt"]
 
 async def load_schema_cache(pool: asyncpg.Pool) -> None:
     global SCHEMA_MAP, FIELD_INDEX, SCHEMA_HINT
@@ -303,14 +250,16 @@ def dynamic_hint_for_question(q: str) -> str:
     return ("\n".join(hints)).strip()
 
 async def gpt_emit_sql(question: str, extra: str = "") -> str:
-    sys = {"role": "system", "content": SYSTEM_PROMPT_SQL_AGENT}
+    system_prompt = await get_prompt(app.state.pool, "SYSTEM_PROMPT_SQL_AGENT")
+    sys = {"role": "system", "content": system_prompt }
     dyn = dynamic_hint_for_question(question)
     user = {"role": "user", "content": f"{SCHEMA_HINT}\n\n{extra}\n{('- ' + dyn) if dyn else ''}\n\nUser question: {question}\nReturn ONLY the SQL."}
     out = await openai_chat([sys, user])
     return sanitize_llm_sql(out)
 
 async def repair_sql(question: str, sql: str, reason: str) -> str:
-    sys = {"role": "system", "content": SYSTEM_PROMPT_SQL_AGENT}
+    system_prompt = await get_prompt(app.state.pool, "SYSTEM_PROMPT_SQL_AGENT")
+    sys = {"role": "system", "content": system_prompt }
     user = {"role": "user", "content": f"{SCHEMA_HINT}\n\nIssue to fix:\n{reason}\n\nFix the SQL (same intent) and return ONLY the corrected SQL:\n{sql}"}
     out = await openai_chat([sys, user])
     return sanitize_llm_sql(out)
@@ -444,11 +393,12 @@ async def answer(body: AnswerReq):
 @app.post("/report")
 async def generate_report(data: ReportRequest):
     url = "https://api.openai.com/v1/chat/completions"
+    system_prompt = await get_prompt(app.state.pool, "SYSTEM_PROMPT_REPORT_AGENT")
     payload = {
         "model": "gpt-4.1",
         "temperature": 0,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT_REPORT_AGENT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": str(data)}
         ]
     }
@@ -464,19 +414,14 @@ async def generate_report(data: ReportRequest):
 
 @app.post("/answer-report")
 async def answer_report(answer_req: AnswerReq):
-    timeout = httpx.Timeout(60.0, read=60.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        answer_resp = await client.post("https://sales-agent-fastapi.onrender.com/answer", json=answer_req.dict())
-        answer_response = answer_resp.json()
-        print("Answer Response:", answer_response)
-        if "error" in answer_response:
-            return answer_response
-        report_req = {
-            "question":answer_req.chatInput,
-            "sqlData":answer_response.get("data", [])
-        }
-        report_resp = await client.post("https://sales-agent-fastapi.onrender.com/report", json=report_req)
-        report_response = report_resp.json()
+    answer_response = await answer(answer_req)
+    if "error" in answer_response:
+        return answer_response
+    report_req = ReportRequest(
+        question=answer_req.chatInput,
+        sqlData=answer_response.get("data", [])
+    )
+    report_response = await generate_report(report_req)
     return {
         "answer": answer_response,
         "report": report_response.get("report")
