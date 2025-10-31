@@ -10,7 +10,8 @@ import difflib
 import uvicorn
 
 load_dotenv()
-DB_URL = os.getenv("DATABASE_URL", "")
+DB_URL_MAIN = os.getenv("DATABASE_URL_MAIN", "")
+DB_URL_QUERIES = os.getenv("DATABASE_URL_QUERIES", "")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "60"))
@@ -40,6 +41,9 @@ class AnswerReq(BaseModel):
 class ReportRequest(BaseModel):
     question: str
     sqlData: Optional[List] = None
+
+class DecisionRequest(BaseModel):
+    chatInput: str
 
 def normalize(q: str) -> str:
     return re.sub(r"\s+", " ", q.lower().strip())
@@ -342,20 +346,60 @@ async def repair_from_schema_mismatch(question: str, sql: str, mismatch_detail: 
     validate_fields_against_schema(fixed)
     return fixed
 
+async def get_exact_query(question: str) -> str | None:
+    pool = app.state.pool
+    async with app.state.pool_queries.acquire() as conn:
+        row = await conn.fetchrow("SELECT sql FROM common_questions WHERE question = $1", question)
+        if not row:
+            return None, None
+        sql = row["sql"]
+        is_select_only(sql)
+        tables_allowed(sql)
+        await pool.execute(f"SET LOCAL statement_timeout = {STATEMENT_TIMEOUT_MS}")
+        rows = await pool.fetch(sql)
+    data = [dict(r) for r in rows]
+    return sql, data
+
 @app.on_event("startup")
 async def startup():
-    app.state.pool = await asyncpg.create_pool(dsn=DB_URL, min_size=1, max_size=8, ssl='require')
+    app.state.pool = await asyncpg.create_pool(dsn=DB_URL_MAIN, min_size=1, max_size=8, ssl='require')
+    app.state.pool_queries = await asyncpg.create_pool(dsn=DB_URL_QUERIES, min_size=1, max_size=4, ssl='require')
     await load_schema_cache(app.state.pool)
 
 @app.on_event("shutdown")
 async def shutdown():
-    pool = app.state.pool
-    if pool:
-        await pool.close()
+    if app.state.pool:
+        await app.state.pool.close()
+    if app.state.pool_queries:
+        await app.state.pool_queries.close()
 
 @app.get("/healthz")
 async def healthz():
     return {"status": "ok"}
+
+@app.post("/decide")
+async def decide(data: DecisionRequest):
+    url = "https://api.openai.com/v1/chat/completions"
+    system_prompt = await get_prompt(app.state.pool, "SYSTEM_PROMPT_QUERY_DECISION_AGENT")
+    payload = {
+        "model": "gpt-4.1",
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": str(data)}
+        ]
+    }
+    headers = {
+        "Authorization": f"Bearer {OPENAI_KEY}",
+        "Content-Type": "application/json"
+    }
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        result = response.json()
+        content = result["choices"][0]["message"]["content"]
+        decision_data = json.loads(content)
+    return decision_data 
 
 @app.post("/answer")
 async def answer(body: AnswerReq):
@@ -413,19 +457,36 @@ async def generate_report(data: ReportRequest):
     return {"report": result["choices"][0]["message"]["content"]}
 
 @app.post("/answer-report")
-async def answer_report(answer_req: AnswerReq):
-    answer_response = await answer(answer_req)
-    if "error" in answer_response:
-        return answer_response
-    report_req = ReportRequest(
-        question=answer_req.chatInput,
-        sqlData=answer_response.get("data", [])
-    )
-    report_response = await generate_report(report_req)
-    return {
-        "answer": answer_response,
-        "report": report_response.get("report")
-    }
+async def answer_report(decide_req: DecisionRequest):
+    decide_response = await decide(decide_req)
+    if decide_response.get("is_data_query") == False:
+        report_req = ReportRequest(question=decide_req.chatInput, sqlData=None)
+        report_response = await generate_report(report_req)
+        return {
+            "report": report_response.get("report")
+        }
+    elif decide_response.get("is_data_query") == True:
+        sql, data = await get_exact_query(decide_req.chatInput)
+        if sql is not None:
+            report_req = ReportRequest(question=decide_req.chatInput, sqlData=data)
+            report_response = await generate_report(report_req)
+            return {
+                "report": report_response.get("report")
+            }
+        else:
+            answer_req = AnswerReq(chatInput=decide_req.chatInput, needs_data=str(decide_response.get("is_data_query")), allow_llm=True)
+            answer_response = await answer(answer_req)
+            if "error" in answer_response:
+                return answer_response
+            report_req = ReportRequest(
+                question=answer_req.chatInput,
+                sqlData=answer_response.get("data", [])
+            )
+            report_response = await generate_report(report_req)
+            return{
+                "answer": answer_response,
+                "report": report_response.get("report")
+            }
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
