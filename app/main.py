@@ -10,8 +10,7 @@ import difflib
 import uvicorn
 
 load_dotenv()
-DB_URL_MAIN = os.getenv("DATABASE_URL_MAIN", "")
-DB_URL_QUERIES = os.getenv("DATABASE_URL_QUERIES", "")
+DB_URL = os.getenv("DATABASE_URL", "")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "60"))
@@ -348,7 +347,7 @@ async def repair_from_schema_mismatch(question: str, sql: str, mismatch_detail: 
 
 async def get_exact_query(question: str) -> str | None:
     pool = app.state.pool
-    async with app.state.pool_queries.acquire() as conn:
+    async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT sql FROM common_questions WHERE question = $1", question)
         if not row:
             return None, None
@@ -362,16 +361,13 @@ async def get_exact_query(question: str) -> str | None:
 
 @app.on_event("startup")
 async def startup():
-    app.state.pool = await asyncpg.create_pool(dsn=DB_URL_MAIN, min_size=1, max_size=8, ssl='require')
-    app.state.pool_queries = await asyncpg.create_pool(dsn=DB_URL_QUERIES, min_size=1, max_size=4, ssl='require')
+    app.state.pool = await asyncpg.create_pool(dsn=DB_URL, min_size=1, max_size=8, ssl='require')
     await load_schema_cache(app.state.pool)
 
 @app.on_event("shutdown")
 async def shutdown():
     if app.state.pool:
         await app.state.pool.close()
-    if app.state.pool_queries:
-        await app.state.pool_queries.close()
 
 @app.get("/healthz")
 async def healthz():
