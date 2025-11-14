@@ -440,22 +440,34 @@ async def generate_report(data: ReportRequest):
 @app.post("/answer-report")
 async def answer_report(decide_req: DecisionRequest):
     decide_response = await decide(decide_req)
-    if decide_response.get("is_data_query") is False:
+    if decide_response.get("is_data_query") == False:
         report_req = ReportRequest(question=decide_req.chatInput, sqlData=None)
         report_response = await generate_report(report_req)
-        return {"report": report_response.get("report")}
-    sql, data = await get_exact_query(decide_req.chatInput)
-    if sql is not None:
-        report_req = ReportRequest(question=decide_req.chatInput, sqlData=data)
-        report_response = await generate_report(report_req)
-        return {"report": report_response.get("report")}
-    answer_req = AnswerReq(chatInput=decide_req.chatInput, needs_data="YES", allow_llm=True)
-    answer_response = await answer(answer_req)
-    if "error" in answer_response:
-        return answer_response
-    report_req = ReportRequest(question=answer_response["question"], sqlData=answer_response.get("data", []))
-    report_response = await generate_report(report_req)
-    return {"answer": answer_response, "report": report_response.get("report")}
+        return {
+            "report": report_response.get("report")
+        }
+    elif decide_response.get("is_data_query") == True:
+        sql, data = await get_exact_query(decide_req.chatInput)
+        if sql is not None:
+            report_req = ReportRequest(question=decide_req.chatInput, sqlData=data)
+            report_response = await generate_report(report_req)
+            return {
+                "report": report_response.get("report")
+            }
+        else:
+            answer_req = AnswerReq(chatInput=decide_req.chatInput, needs_data=str(decide_response.get("is_data_query")), allow_llm=True)
+            answer_response = await answer(answer_req)
+            if "error" in answer_response:
+                return answer_response
+            report_req = ReportRequest(
+                question=answer_req.chatInput,
+                sqlData=answer_response.get("data", [])
+            )
+            report_response = await generate_report(report_req)
+            return{
+                "answer": answer_response,
+                "report": report_response.get("report")
+            }
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
